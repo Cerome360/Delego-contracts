@@ -519,6 +519,42 @@ pub enum DataKey {
 /// for the recency-weight scale in [`recency_weight_bps`].
 const BPS_SCALE: i128 = 10_000;
 
+/// Clamps a raw score expressed in basis points into the contract's legal
+/// `0..=10_000` range (0.00% to 100.00%).
+///
+/// Every score the contract persists is produced here, so an intermediate
+/// value can never escape the legal band: a merchant that accumulates
+/// extreme consecutive negative reviews saturates cleanly at `0` instead of
+/// wrapping to `u32::MAX` or panicking on an underflow, and a merchant that
+/// accumulates maximum-value outcomes saturates at `10_000` rather than
+/// exceeding 100%.
+///
+/// The argument is a signed `i64` (not `u32`) precisely because the raw
+/// value can legitimately be negative once dispute/fraud penalties are
+/// subtracted from the weighted base score — the sign carries information
+/// until this function folds it into the floor.
+pub fn normalize_score(raw_score: i64) -> u32 {
+    if raw_score <= 0 {
+        0
+    } else if raw_score >= BPS_SCALE as i64 {
+        BPS_SCALE as u32
+    } else {
+        raw_score as u32
+    }
+}
+
+/// `i128`-domain counterpart of [`normalize_score`].
+///
+/// Score arithmetic is carried out in `i128` (weights and values are both
+/// basis points, and up to `SCORE_WINDOW` records are summed), so the raw
+/// result is clamped into `i64` before delegating to [`normalize_score`].
+/// That keeps the single source of truth for the legal score band while
+/// guaranteeing the narrowing conversion can never truncate.
+fn normalize_score_i128(raw_score: i128) -> u32 {
+    let bounded = raw_score.clamp(i64::MIN as i128, i64::MAX as i128);
+    normalize_score(bounded as i64)
+}
+
 /// The maximum number of full half-lives after which the recency weight is
 /// treated as zero.  With `BPS_SCALE = 10_000`, the right-shift
 /// `BPS_SCALE >> full_halvings` yields 1 at `full_halvings = 13`
@@ -593,12 +629,16 @@ pub fn calculate_decayed_score(
     ledgers_elapsed: u32,
     half_life_ledgers: u32,
 ) -> u32 {
-    fixed_point_decay(
+    let decayed = fixed_point_decay(
         historical_score as u64,
         ledgers_elapsed as u64,
         half_life_ledgers as u64,
         u32::BITS as u64,
-    ) as u32
+    );
+    // Decay never increases a score, but the input is caller-supplied and may
+    // arrive outside the legal band; normalizing here keeps every decay result
+    // within `0..=10_000` as well.
+    normalize_score_i128(decayed as i128)
 }
 
 fn fixed_point_decay(
@@ -1926,10 +1966,12 @@ impl ReputationContract {
             0
         };
         let penalty = accumulator.disputed_recent * (config.dispute_penalty_bps as i128);
-        rep.score = (base_score - penalty).clamp(0, BPS_SCALE) as u32;
+        // Route the raw (possibly negative) result through the single bounded
+        // normalization helper; `i128` arithmetic cannot overflow here and the
+        // helper clamps the final value into `0..=10_000`.
+        rep.score = normalize_score_i128(base_score.saturating_sub(penalty));
         rep.avg_rating = if accumulator.rating_weight_sum > 0 {
-            (accumulator.rating_weighted_sum / accumulator.rating_weight_sum).clamp(0, BPS_SCALE)
-                as u32
+            normalize_score_i128(accumulator.rating_weighted_sum / accumulator.rating_weight_sum)
         } else {
             0
         };
@@ -2031,7 +2073,7 @@ impl ReputationContract {
         };
         let penalty = disputed_recent * (config.dispute_penalty_bps as i128);
         let avg_rating = if rating_weight_sum > 0 {
-            (rating_weighted_sum / rating_weight_sum).clamp(0, BPS_SCALE) as u32
+            normalize_score_i128(rating_weighted_sum / rating_weight_sum)
         } else {
             0
         };
@@ -2039,10 +2081,10 @@ impl ReputationContract {
         Ok((
             ScoreDecomposition {
                 entity: entity.clone(),
-                base_score_bps: base_score,
+                base_score_bps: normalize_score_i128(base_score) as i128,
                 penalty_bps: penalty,
                 total_transactions,
-                final_score: (base_score - penalty).clamp(0, BPS_SCALE) as u32,
+                final_score: normalize_score_i128(base_score.saturating_sub(penalty)),
             },
             avg_rating,
             now,
