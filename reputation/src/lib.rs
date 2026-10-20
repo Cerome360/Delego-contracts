@@ -458,12 +458,38 @@ pub struct ReputationCursor {
 }
 
 /// A single page of the reputation-ranked merchant index.
+///
+/// `next_cursor` cannot be an `Option<ReputationCursor>` field: the SDK's
+/// `#[contracttype]` XDR conversions require every field type to implement
+/// `Into<ScVal>`, and a nested contract type only provides the fallible
+/// `TryFrom<&T> for ScVal` conversion. The cursor is therefore encoded as the
+/// `(score_bps, merchant_id)` pair of the last record on the page, with
+/// `has_more` telling the caller whether to resume from it.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RankedMerchantPage {
     pub merchants: Vec<MerchantView>,
-    pub next_cursor: Option<ReputationCursor>,
+    /// `true` when at least one eligible record follows this page.
+    pub has_more: bool,
+    /// `score_bps` of the last merchant emitted on this page.
+    pub next_last_score_bps: u32,
+    /// `merchant_id` of the last merchant emitted on this page.
+    pub next_last_merchant_id: u64,
     pub total_count: u32,
+}
+
+impl RankedMerchantPage {
+    /// Rebuilds the cursor a caller should pass to the next
+    /// [`ReputationContract::get_ranked_merchants`] call, if any.
+    pub fn next_cursor(&self) -> Option<ReputationCursor> {
+        if !self.has_more {
+            return None;
+        }
+        Some(ReputationCursor {
+            last_score_bps: self.next_last_score_bps,
+            last_merchant_id: self.next_last_merchant_id,
+        })
+    }
 }
 
 /// Read-only projection of a merchant's reputation used by the discovery
@@ -1249,7 +1275,9 @@ impl ReputationContract {
         if total_count == 0 {
             return Ok(RankedMerchantPage {
                 merchants,
-                next_cursor: None,
+                has_more: false,
+                next_last_score_bps: 0,
+                next_last_merchant_id: 0,
                 total_count,
             });
         }
@@ -1260,7 +1288,9 @@ impl ReputationContract {
         // iterating ids downward visits candidates in the exact tie-break
         // order the index requires; the score comparison then filters to the
         // keyset window.
-        let mut next_cursor: Option<ReputationCursor> = None;
+        let mut has_more = false;
+        let mut last_score_bps = 0u32;
+        let mut last_merchant_id = 0u64;
         let mut id = total_count as u64;
         while id > 0 {
             id -= 1;
@@ -1293,14 +1323,15 @@ impl ReputationContract {
             if merchants.len() >= page_size {
                 // We have a full page and found at least one more eligible
                 // record, so the caller can continue from the last emitted
-                // pair.
-                next_cursor = Some(ReputationCursor {
-                    last_score_bps: rep.score,
-                    last_merchant_id: id,
-                });
+                // pair. The cursor must point at the last record already
+                // returned, not at the first record of the next page, or the
+                // keyset filter would skip that record.
+                has_more = true;
                 break;
             }
 
+            last_score_bps = rep.score;
+            last_merchant_id = id;
             merchants.push_back(MerchantView {
                 merchant_id: id,
                 entity,
@@ -1312,7 +1343,9 @@ impl ReputationContract {
 
         Ok(RankedMerchantPage {
             merchants,
-            next_cursor,
+            has_more,
+            next_last_score_bps: last_score_bps,
+            next_last_merchant_id: last_merchant_id,
             total_count,
         })
     }
