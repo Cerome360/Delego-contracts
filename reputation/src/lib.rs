@@ -315,14 +315,13 @@ pub enum ReputationError {
     /// No active (unresolved) flag from reporter.
     NoActiveFlag = 3010,
     /// Reporter did not flag the entity.
-    NotFlagReporter = 0x0003_000B,
+    NotFlagReporter = 3011,
     /// `submit_verified_review`'s `VerifiedReviewProof` did not check out:
     /// the referenced escrow could not be read from `escrow_contract`, is
     /// not in `Released` status, its `order_id` did not match
     /// `order_hash`, or `rater`/`entity` are not its buyer/seller pair
     /// (issue #286).
-    UnverifiedOrder = 0x0003_000C,
-    NotFlagReporter = 3011,
+    UnverifiedOrder = 3012,
 }
 
 #[cfg(test)]
